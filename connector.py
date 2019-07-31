@@ -1,145 +1,154 @@
+import sys
+import traceback
 import asyncio
-from dataclasses import dataclass
-
-
-@dataclass
-class StreamMeta:
-    streamId = None
-    reader = None
-    writer = None
-
-    def close(self):
-        self.reader.close()
-        self.writer.close()
+import time
+from meta_stream import StreamMeta
 
 
 class TunnelState:
     def __init__(self):
-        self.sinkConnection = None
+        self.proxyWithoutFuture = set([])
+        self.future2Proxy = {}
+        self.sid2ProxyEndpoint = {}
+        self.newProxyFuture = None
         self.nextStreamId = 1
-        self.streams = {} # stream Id => (reader, writer)?
 
-    def findById(self, streamId):
-        streamMeta = self.streams.get(streamId)
-        newStream = streaMeta is None
-        if streamMeta is None:
-            reader, writer = await asyncio.open_connection('127.0.0.1', 9011)
-            self.streams[streamId] = StreamMeta(streamId, reader, writer)
-            streamMeta = self.streams[streamId]
+        self.clientConnection = None
 
-        return streamMeta, newStream
-
-    def removeClient(self, streamMeta):
-        del self.streams[streamMeta.streamId]
+    def removeStream(self, streamMeta):
+        del self.sid2ProxyEndpoint[streamMeta.streamId]
         streamMeta.close()
-        if self.sinkConnection:
-            self.sinkConnection.write(int.to_bytes(streamMeta.streamId, length=8, byteorder='big'))
-            self.sinkConnection.write(int.to_bytes(0, length=2, byteorder='big'))
-            self.sinkConnection.drain()
+
+    def removeStreamIfExist(self, streamId):
+        metaStream = self.sid2ProxyEndpoint.get(streamId)
+        if metaStream is not None:
+            self.removeStream(metaStream)
 
 
-@dataclass
-class SinkConn:
-    reader = None
-    writer = None
+class Params:
+    def __init__(self, clientHost, clientPort, proxyHost, proxyPort):
+        self.clientHost = clientHost
+        self.clientPort = clientPort
+        self.proxyHost = proxyHost
+        self.proxyPort = proxyPort
 
-class SecondSink(Exception):
-    pass
 
-tunnelState: TunnelState = TunnelState()
+class Connector:
+    def __init__(self, params, state):
+        self.params = params
+        self.state = state
 
-async def backTunnelConnector():
-    reader, writer = await asyncio.open_connection('127.0.0.1', 9016)
-    tunnelState.sinkConnection = SinkConn(reader, writer)
-    try:
-        print('Connected')
+    async def run(self):
+        await self.connectToClient()
+        await asyncio.wait([self.pollClient(), self.pollProxy()])
+
+    async def connectToClient(self):
+        host, port = self.params.clientHost, self.params.clientPort
+        reader, writer = await asyncio.open_connection(host, port)
+        self.state.clientConnection = StreamMeta(None, reader, writer)
+        print('Connected to client [%s:%d]' % (host, port))
+
+    async def pollClient(self):
         while True:
-            streamId = int.from_bytes(await reader.readexactly(8), byteorder='big')
-            streamMeta, newStream = tunnelState.findById(streamId)
-            packetSize = int.from_bytes(await reader.readexactly(2), byteorder='big')
-            if packetSize > 0:
-                data = await reader.readexactly(packetSize)
-                if not data:
-                    raise Exception("back tunnel connection ended");
-                print('Received: %d from %d' % (packetSize, streamId))
-                try:
-                    streamMeta.writer.write(data)
-                    await streamMeta.writer.drain()
-                except:
-                    print("Failed client")
-                    tunnelState.closeClient(streamMeta, notifyBackTunnel=True)
-            elif not newStream:
-                tunnelState.closeClient(streamMeta)
-    finally:
-        print('Close the connection')
-        writer.close()
-        await writer.wait_closed()
-
-async def sinkConnectionHanlder(reader, writer):
-    try:
-        if tunnelState.sinkConnection is None:
-            print("sink connection is active")
-            tunnelState.sinkConnection = SinkConn(reader,  writer)
-        else:
-            raise SecondSink("reject second sink connection")
-
-        while True:
-            streamId = int.from_bytes(await reader.readexactly(8), byteorder='big')
-            streamMeta = tunnelState.streams.get(streamId)
-            if streamMeta is None:
-                raise Exception("bad streamId %d from sink" % (streamId,))
-            packetSize = int.from_bytes(await reader.readexactly(2), byteorder='big')
-
-            data = await reader.readexactly(packetSize)
-            if packetSize > 0 and not data:
-                raise Exception("sink closed connection")
             try:
+                client = self.state.clientConnection
+
+                streamId = await client.readInt(8)
+
+                packetSize = await client.readInt(2)
+
+                data = await client.readExactly(packetSize)
+                if packetSize > 0 and not data:
+                    raise Exception("sink closed connection")
+
                 if packetSize == 0:
-                    raise Exception("remote connection for stream %d is closed" % (packetSize, streamId))
-                print("send %d from sink %d" % (packetSize, streamId))
-                streamMeta.writer.write(data)
-                await streamMeta.writer.drain()
+                    self.state.removeStreamIfExist(streamId)
+                    continue
+
+                try:
+                    streamMeta = await self.getToProxyStream(streamId)
+                    print("send %d from sink %d" % (packetSize, streamId))
+                    streamMeta.write(data)
+                    await streamMeta.drain()
+                except Exception as e:
+                    self.state.removeStream(streamMeta)
+            except KeyboardInterrupt:
+                print("keyboard int1")
+                sys.exit()
             except Exception as e:
-                print("Delivery to stream %d failed %s" % (streamId, e))
-                del tunnelState.streams[streamId]
-                streamMeta.close()
+                print(e)
+                traceback.print_exc(file=sys.stdout)
+                print("Reconnect to client")
+                self.state.clientConnection.close()
 
-    except SecondSink as e:
-        print(e)
-        reader.close()
-    except Exception as e:
-        print(e)
-        reader.close()
-        print("Sink is deactivated")
-        tunnelState.sinkConnection = None
-    finally:
-        writer.close()
+                try:
+                    await asyncio.sleep(3)
+                    await self.connectToClient()
+                    print("Reconnected")
+                except KeyboardInterrupt:
+                    print("keyboard int2")
+                    sys.exit()
+                except Exception as e:
+                    print("Failed to reconnect")
+                    print(e)
 
+    async def getToProxyStream(self, streamId):
+        streamMeta = self.state.sid2ProxyEndpoint.get(streamId)
 
-async def clientConnectionHanlder(reader, writer):
-    streamMeta = tunnelState.registerClient(reader, writer)
-    try:
+        if streamMeta is None:
+            host, port = self.params.proxyHost, self.params.proxyPort
+            reader, writer = await asyncio.open_connection(host, port)
+            streamMeta = StreamMeta(streamId, reader, writer)
+            self.state.sid2ProxyEndpoint[streamId] = streamMeta
+            print('Connected to proxy [%s:%d] for stream %d'
+                  % (host, port, streamId))
+            self.state.proxyWithoutFuture.add(streamMeta)
+            oldProxy = self.state.newProxyFuture
+            self.state.newProxyFuture = asyncio.Future()
+            oldProxy.set_result('new client')
+
+        return streamMeta
+
+    async def pollProxy(self):
+        print("Poll proxy connections")
+        pending = set([])
         while True:
-            data = await reader.read(1000)
-            if not data:
-                raise Exception("Client %s closed connection" % (streamMeta.streamId,))
-            else:
-                if tunnelState.sinkConnection is None:
-                    raise Exception("No active sink connection")
-                sink = tunnelState.sinkConnection
-                print("Send to sink %d from %d" % (len(data), streamMeta.streamId))
-                sink.write(int.to_bytes(streamMeta.streamId, length=8, byteorder='big'))
-                sink.write(int.to_bytes(len(data), length=2, byteorder='big'))
-                sink.write(data)
-                await sink.drain()  # Flow control, see later
-    finally:
-        tunnelState.removeClient(streamMeta)
+            for proxy in list(self.state.proxyWithoutFuture):
+                readTask = asyncio.create_task(self.readProxyStream(proxy))
+                pending.add(readTask)
+                self.state.future2Proxy[readTask] = proxy
+                self.state.proxyWithoutFuture.remove(proxy)
 
-# async def pollProxy():
-#     for streamMeta in tunnelState.streams.values():
-#         streamMeta.read
+            if self.state.newProxyFuture is None:
+                self.state.newProxyFuture = asyncio.Future()
+            pending.add(self.state.newProxyFuture)
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            for doneFuture in done:
+                proxy = self.state.future2Proxy.get(doneFuture)
+                if proxy is None:  # new clien future
+                    pass
+                else:
+                    del self.state.future2Proxy[doneFuture]
+                    if proxy.isClosed():
+                        print("Proxy %d is closed" % proxy.streamId)
+                    else:
+                        self.state.proxyWithoutFuture.add(proxy)
 
-async def main():
-    await asyncio.wait([backTunnelConnector()])
+    async def readProxyStream(self, proxy):
+        data = await proxy.reader.read(1000)
+        print("Client %d read %s bytes at %f"
+              % (proxy.streamId, len(data), time.time()))
+        if not data:
+            self.state.removeStreamIfExist(proxy.streamId)
+        client = self.state.clientConnection
+        client.writeInt(proxy.streamId, 8)
+        client.writeInt(len(data), 2)
+        client.write(data)
+        await client.drain()
 
-asyncio.run(main())
+
+asyncio.run(Connector(
+    Params(clientHost='127.0.0.1', clientPort=9012,
+           proxyHost='127.0.0.1', proxyPort=9013),
+    TunnelState()).run())

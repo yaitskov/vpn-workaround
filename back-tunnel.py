@@ -1,39 +1,22 @@
+import sys
+import traceback
 import asyncio
-from dataclasses import dataclass
-
-
-# async def tcp_echo_client(message):
-#     reader, writer = await asyncio.open_connection(
-#         '127.0.0.1', 8888)
-
-#     print(f'Send: {message!r}')
-#     writer.write(message.encode())
-
-#     data = await reader.read(100)
-#     print(f'Received: {data.decode()!r}')
-
-#     print('Close the connection')
-#     writer.close()
-#     await writer.wait_closed()
-
-# asyncio.run(tcp_echo_client('Hello World!'))
-
-@dataclass
-class StreamMeta:
-    streamId = None
-    reader = None
-    writer = None
-
-    def close(self):
-        self.reader.close()
-        self.writer.close()
+from meta_stream import StreamMeta
 
 
 class TunnelState:
     def __init__(self):
         self.sinkConnection = None
         self.nextStreamId = 1
-        self.streams = {} # stream Id => (reader, writer)?
+        self.streams = {}
+
+    def closeSink(self):
+        print("Sink is deactivated")
+        self.sinkConnection = None
+        for stream in self.streams.values():
+            stream.close()
+
+        self.streams = {}
 
     def registerClient(self, reader, writer):
         streamId = self.nextStreamId
@@ -42,90 +25,102 @@ class TunnelState:
         self.streams[streamId] = StreamMeta(streamId, reader, writer)
         return self.streams[streamId]
 
-    def removeClient(self, streamMeta):
-        del self.streams[streamMeta.streamId]
-        streamMeta.close()
+    def closeClient(self, streamMeta):
+        if streamMeta.streamId in self.streams:
+            del self.streams[streamMeta.streamId]
+            streamMeta.close()
+        else:
+            print("Stream %d is already closed" % streamMeta.streamId)
+
+    async def removeClient(self, streamMeta):
+        self.closeClient(streamMeta)
         if self.sinkConnection:
-            self.sinkConnection.write(int.to_bytes(streamMeta.streamId, length=8, byteorder='big'))
-            self.sinkConnection.write(int.to_bytes(0, length=2, byteorder='big'))
-            self.sinkConnection.drain()
+            sink = self.sinkConnection
+            sink.writeInt(streamMeta.streamId, 8)
+            sink.writeInt(0, 2)
+            await sink.drain()
 
-
-@dataclass
-class SinkConn:
-    reader = None
-    writer = None
 
 class SecondSink(Exception):
     pass
 
-tunnelState: TunnelState = TunnelState()
+
+tunnelState = TunnelState()
+
 
 async def sinkConnectionHanlder(reader, writer):
+    if tunnelState.sinkConnection is None:
+        print("sink connection is active")
+        tunnelState.sinkConnection = StreamMeta(None, reader,  writer)
+    else:
+        print("reject second sink connection")
+        writer.close()
+        return
+
+    sink = tunnelState.sinkConnection
+
     try:
-        if tunnelState.sinkConnection is None:
-            print("sink connection is active")
-            tunnelState.sinkConnection = SinkConn(reader,  writer)
-        else:
-            raise SecondSink("reject second sink connection")
-
         while True:
-            streamId = int.from_bytes(await reader.readexactly(8), byteorder='big')
+            streamId = await sink.readInt(8)
             streamMeta = tunnelState.streams.get(streamId)
-            if streamMeta is None:
-                raise Exception("bad streamId %d from sink" % (streamId,))
-            packetSize = int.from_bytes(await reader.readexactly(2), byteorder='big')
+            packetSize = await sink.readInt(2)
+            data = await sink.readExactly(packetSize)
 
-            data = await reader.readexactly(packetSize)
+            if streamMeta is None:
+                if packetSize:
+                    print("bad streamId %d from sink" % streamId)
+                else:
+                    print("Zombi stream %d" % streamId)
+                continue
+
             if packetSize > 0 and not data:
                 raise Exception("sink closed connection")
+            elif packetSize == 0:
+                print("remote connection for stream %d is closed" % streamId)
+                tunnelState.closeClient(streamMeta)
+                continue
+
             try:
-                if packetSize == 0:
-                    raise Exception("remote connection for stream %d is closed" % (packetSize, streamId))
                 print("send %d from sink %d" % (packetSize, streamId))
-                streamMeta.writer.write(data)
-                await streamMeta.writer.drain()
+                streamMeta.write(data)
+                await streamMeta.drain()
             except Exception as e:
                 print("Delivery to stream %d failed %s" % (streamId, e))
-                del tunnelState.streams[streamId]
-                streamMeta.close()
-
-    except SecondSink as e:
-        print(e)
-        reader.close()
+                tunnelState.closeClient(streamMeta)
     except Exception as e:
-        print(e)
-        reader.close()
-        print("Sink is deactivated")
-        tunnelState.sinkConnection = None
-    finally:
-        writer.close()
+        traceback.print_exc(file=sys.stdout)
+        tunnelState.closeSink()
 
 
 async def clientConnectionHanlder(reader, writer):
     streamMeta = tunnelState.registerClient(reader, writer)
     try:
         while True:
-            data = await reader.read(1000)
+            data = await reader.read(4000)
             if not data:
-                raise Exception("Client %s closed connection" % (streamMeta.streamId,))
+                raise Exception("Client %s closed connection"
+                                % streamMeta.streamId)
             else:
                 if tunnelState.sinkConnection is None:
                     raise Exception("No active sink connection")
                 sink = tunnelState.sinkConnection
-                print("Send to sink %d from %d" % (len(data), streamMeta.streamId))
-                sink.write(int.to_bytes(streamMeta.streamId, length=8, byteorder='big'))
-                sink.write(int.to_bytes(len(data), length=2, byteorder='big'))
+                print("Send to sink %d %d bytes"
+                      % (streamMeta.streamId, len(data)))
+                sink.writeInt(streamMeta.streamId, 8)
+                sink.writeInt(len(data), 2)
                 sink.write(data)
                 await sink.drain()  # Flow control, see later
+    except Exception as e:
+        print(e)
     finally:
-        tunnelState.removeClient(streamMeta)
+        await tunnelState.removeClient(streamMeta)
 
 
 async def clientsMain(host, port):
     print("Clients accepted on %s %d" % (host, port))
     server = await asyncio.start_server(clientConnectionHanlder, host, port)
     await server.serve_forever()
+
 
 async def sinkMain(host, port):
     print("Sink accepted on %s %d" % (host, port))
@@ -134,7 +129,8 @@ async def sinkMain(host, port):
 
 
 async def multi():
-    await asyncio.wait([sinkMain('0.0.0.0', 9015), clientsMain('0.0.0.0', 9016)])
+    await asyncio.wait([
+        clientsMain('0.0.0.0', 9011),
+        sinkMain('0.0.0.0', 9012)])
 
-#asyncio.run(main('0.0.0.0', 9015))
 asyncio.run(multi())
