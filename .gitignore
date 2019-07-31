@@ -2,4 +2,6 @@
 *.pdf
 *.back
 .~*#
+__pycache__
+/util
 *.apk
