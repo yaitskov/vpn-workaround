@@ -2,6 +2,7 @@ import sys
 import traceback
 import asyncio
 from meta_stream import StreamMeta
+import ssl
 
 
 class TunnelState:
@@ -115,18 +116,30 @@ async def clientConnectionHanlder(reader, writer):
     finally:
         await tunnelState.removeClient(streamMeta)
 
+def initSsl():
+    sslCtx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER) # ssl.PROTOCOL_TLSv1_2)
+    sslCtx.options |= ssl.OP_NO_TLSv1
+    sslCtx.options |= ssl.OP_NO_TLSv1_1
+    sslCtx.options |= ssl.OP_SINGLE_DH_USE
+    sslCtx.options |= ssl.OP_SINGLE_ECDH_USE
+    # sslCtx.load_verify_locations(cafile='./root-ca.crt')
+    sslCtx.check_hostname = False
+    sslCtx.verify_mode = ssl.VerifyMode.CERT_NONE
+    sslCtx.set_ciphers('ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384')
+    sslCtx.load_cert_chain(certfile="./cloud-sport.pl.crt", keyfile="./cloud-sport.pl.key")
+    return sslCtx
+
+async def startServer(label, handler, host, port, ssl):
+    print("%s accepted on %s %d" % (label, host, port))
+    server = await asyncio.start_server(
+        handler, host, port, ssl=ssl)
+    await server.serve_forever()
 
 async def clientsMain(host, port):
-    print("Clients accepted on %s %d" % (host, port))
-    server = await asyncio.start_server(clientConnectionHanlder, host, port)
-    await server.serve_forever()
-
+    await startServer("Clients", clientConnectionHanlder, host, port, None)
 
 async def sinkMain(host, port):
-    print("Sink accepted on %s %d" % (host, port))
-    server = await asyncio.start_server(sinkConnectionHanlder, host, port)
-    await server.serve_forever()
-
+    await startServer("Sink", sinkConnectionHanlder, host, port, initSsl())
 
 async def multi():
     await asyncio.wait([

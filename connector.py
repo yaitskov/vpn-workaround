@@ -3,7 +3,7 @@ import traceback
 import asyncio
 import time
 from meta_stream import StreamMeta
-
+import ssl
 
 class TunnelState:
     def __init__(self):
@@ -32,6 +32,17 @@ class Params:
         self.proxyHost = proxyHost
         self.proxyPort = proxyPort
 
+def initSsl():
+    sslCtx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT) # ssl.PROTOCOL_TLSv1_2)
+    sslCtx.options |= ssl.OP_NO_TLSv1
+    sslCtx.options |= ssl.OP_NO_TLSv1_1
+    # sslCtx.options |= ssl.OP_NO_TLSv1_2
+    sslCtx.load_verify_locations(cafile='./root-ca.crt')
+    sslCtx.check_hostname = False
+    sslCtx.verify_mode = ssl.VerifyMode.CERT_NONE
+    sslCtx.set_ciphers('ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384')
+    # sslCtx.load_cert_chain(certfile="./root-ca.crt", keyfile="./root-ca.key")
+    return sslCtx
 
 class Connector:
     def __init__(self, params, state):
@@ -44,7 +55,7 @@ class Connector:
 
     async def connectToClient(self):
         host, port = self.params.clientHost, self.params.clientPort
-        reader, writer = await asyncio.open_connection(host, port)
+        reader, writer = await asyncio.open_connection(host, port, ssl=initSsl())
         self.state.clientConnection = StreamMeta(None, reader, writer)
         print('Connected to client [%s:%d]' % (host, port))
 
@@ -80,7 +91,7 @@ class Connector:
                 traceback.print_exc(file=sys.stdout)
                 print("Reconnect to client")
                 self.state.clientConnection.close()
-
+                print("CLosed")
                 try:
                     await asyncio.sleep(3)
                     await self.connectToClient()
